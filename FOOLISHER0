@@ -9,7 +9,10 @@ local Visuals = {
 	THICK = 0.15,
 }
 
-local Prefs = { Active = true }
+local Prefs = { 
+	Active = true,
+	TotalMines = 100
+}
 
 local Memory = {
 	Map = { Grid = {}, Marked = {}, ToFlag = {}, ToClear = {} },
@@ -157,9 +160,10 @@ local function ScanGrid()
 	end
 end
 
-local function DeepSearch(foundMines, toOpen)
-	local edge, active, edgeReg = {}, {}, {}
-
+local function SetLogicSearch(foundMines, toOpen)
+	local changed = false
+	local activeNodes = {}
+	
 	for _, unit in ipairs(Memory.Map.Marked) do
 		local mystery, fCount = {}, 0
 		for _, n in ipairs(unit.adj) do
@@ -169,128 +173,63 @@ local function DeepSearch(foundMines, toOpen)
 		
 		local gap = unit.val - fCount
 		if #mystery > 0 then
-			table.insert(active, {gap = gap, unk = mystery})
-			for _, u in ipairs(mystery) do
-				if not edgeReg[u] then
-					edgeReg[u] = true
-					table.insert(edge, u)
+			table.insert(activeNodes, {gap = gap, unk = mystery})
+		end
+	end
+
+	for i = 1, #activeNodes do
+		for j = 1, #activeNodes do
+			if i ~= j then
+				local setA, setB = activeNodes[i], activeNodes[j]
+				
+				-- Intersection boundary check (inherently solves 1-1, 1-2-1, 1-2-2-1)
+				local intersect = {}
+				local aOnly = {}
+				local bMap = {}
+				
+				for _, u in ipairs(setB.unk) do bMap[u] = true end
+				for _, u in ipairs(setA.unk) do
+					if bMap[u] then table.insert(intersect, u)
+					else table.insert(aOnly, u) end
 				end
-			end
-		end
-	end
-
-	if #edge == 0 then return false end
-
-	local link = {}
-	for _, u in ipairs(edge) do link[u] = {} end
-	
-	for _, a in ipairs(active) do
-		for i = 1, #a.unk do
-			for j = i + 1, #a.unk do
-				link[a.unk[i]][a.unk[j]] = true
-				link[a.unk[j]][a.unk[i]] = true
-			end
-		end
-	end
-
-	local seen, clusters = {}, {}
-	for _, u in ipairs(edge) do
-		if not seen[u] then
-			local group = {}
-			local stack = {u}
-			seen[u] = true
-			local ptr = 1
-			while ptr <= #stack do
-				local cur = stack[ptr]
-				ptr += 1
-				table.insert(group, cur)
-				for side in pairs(link[cur]) do
-					if not seen[side] then
-						seen[side] = true
-						table.insert(stack, side)
+				
+				if #intersect > 0 then
+					local bOnly = {}
+					local iMap = {}
+					for _, u in ipairs(intersect) do iMap[u] = true end
+					for _, u in ipairs(setB.unk) do
+						if not iMap[u] then table.insert(bOnly, u) end
+					end
+					
+					local maxMinesInIntersect = setA.gap
+					if maxMinesInIntersect > #intersect then maxMinesInIntersect = #intersect end
+					
+					if setB.gap - maxMinesInIntersect == #bOnly and #bOnly > 0 then
+						for _, u in ipairs(bOnly) do
+							if not foundMines[u] then
+								foundMines[u] = true
+								changed = true
+							end
+						end
+					end
+					
+					local minMinesInIntersect = setA.gap - #aOnly
+					if minMinesInIntersect < 0 then minMinesInIntersect = 0 end
+					
+					if setB.gap == minMinesInIntersect and #bOnly > 0 then
+						for _, u in ipairs(bOnly) do
+							if not toOpen[u] then
+								toOpen[u] = true
+								foundMines[u] = false
+								changed = true
+							end
+						end
 					end
 				end
 			end
-			table.insert(clusters, group)
 		end
 	end
-
-	local success = false
-	for _, bundle in ipairs(clusters) do
-	if #bundle > 20 then return false end
-		local bundleNums = {}
-		local bSet = {}
-		for _, c in ipairs(bundle) do bSet[c] = true end
-		
-		for _, a in ipairs(active) do
-			for _, u in ipairs(a.unk) do
-				if bSet[u] then
-					table.insert(bundleNums, a)
-					break
-				end
-			end
-		end
-
-		local winCount = 0
-		local totalMines = {}
-		for _, c in ipairs(bundle) do totalMines[c] = 0 end
-
-		local function Recursive(step)
-			if step > #bundle then
-				winCount += 1
-				for _, c in ipairs(bundle) do
-					if foundMines[c] == true then totalMines[c] += 1 end
-				end
-				return
-			end
-
-			local target = bundle[step]
-
-			foundMines[target] = false
-			local okS = true
-			for _, a in ipairs(bundleNums) do
-				local pot, cur = 0, 0
-				for _, u in ipairs(a.unk) do
-					if foundMines[u] == true then cur += 1
-					elseif foundMines[u] == nil then pot += 1 end
-				end
-				if cur + pot < a.gap then okS = false break end
-			end
-			if okS then Recursive(step + 1) end
-
-			foundMines[target] = true
-			local okM = true
-			for _, a in ipairs(bundleNums) do
-				local cur = 0
-				for _, u in ipairs(a.unk) do
-					if foundMines[u] == true then cur += 1 end
-				end
-				if cur > a.gap then okM = false break end
-			end
-			if okM then Recursive(step + 1) end
-			
-			foundMines[target] = nil 
-		end
-
-		Recursive(1)
-
-		if winCount > 0 then
-			for _, c in ipairs(bundle) do
-				if totalMines[c] == winCount then
-					foundMines[c] = true
-					success = true
-				elseif totalMines[c] == 0 then
-					toOpen[c] = true
-					foundMines[c] = false 
-					success = true
-				else
-					foundMines[c] = nil 
-				end
-			end
-		end
-	end
-
-	return success
+	return changed
 end
 
 local function Compute()
@@ -313,6 +252,40 @@ local function Compute()
 	while act do
 		act = false
 
+		-- Global Mine Count constraint
+		if Prefs.TotalMines and Prefs.TotalMines > 0 then
+			local flaggedCount = 0
+			local totalUnknowns = {}
+			for x = 0, Memory.Bounds.X - 1 do
+				for z = 0, Memory.Bounds.Z - 1 do
+					local unit = Memory.Map.Grid[x][z]
+					if foundMines[unit] or unit.status == "flagged" then
+						flaggedCount += 1
+					elseif unit.hidden and not toOpen[unit] then
+						table.insert(totalUnknowns, unit)
+					end
+				end
+			end
+			
+			local remaining = Prefs.TotalMines - flaggedCount
+			if remaining == #totalUnknowns and #totalUnknowns > 0 then
+				for _, u in ipairs(totalUnknowns) do
+					if not foundMines[u] then
+						foundMines[u] = true
+						act = true
+					end
+				end
+			elseif remaining == 0 and #totalUnknowns > 0 then
+				for _, u in ipairs(totalUnknowns) do
+					if not toOpen[u] then
+						toOpen[u] = true
+						foundMines[u] = false
+						act = true
+					end
+				end
+			end
+		end
+
 		for _, unit in ipairs(Memory.Map.Marked) do
 			local mystery, fCount = {}, 0
 			for _, n in ipairs(unit.adj) do
@@ -323,20 +296,24 @@ local function Compute()
 			local left = unit.val - fCount
 			if left == #mystery and left > 0 then
 				for _, u in ipairs(mystery) do 
-					foundMines[u] = true 
-					act = true 
+					if not foundMines[u] then
+						foundMines[u] = true 
+						act = true 
+					end
 				end
 			elseif left == 0 and #mystery > 0 then
 				for _, u in ipairs(mystery) do 
-					toOpen[u] = true 
-					foundMines[u] = false 
-					act = true 
+					if not toOpen[u] then
+						toOpen[u] = true 
+						foundMines[u] = false 
+						act = true 
+					end
 				end
 			end
 		end
 
 		if not act then
-			act = DeepSearch(foundMines, toOpen)
+			act = SetLogicSearch(foundMines, toOpen)
 		end
 	end
 

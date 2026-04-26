@@ -2,493 +2,574 @@ local _W = game:GetService("Workspace")
 local _RS = game:GetService("RunService")
 local _P = game:GetService("Players")
 local _UI = game:GetService("UserInputService")
+local LocalPlayer = _P.LocalPlayer -- Required for the watermark
 
 local Visuals = {
-	M_COL = Color3.fromRGB(255, 40, 40),
-	S_COL = Color3.fromRGB(0, 160, 255),
-	THICK = 0.15,
+    M_COL = Color3.fromRGB(255, 40, 40),
+    S_COL = Color3.fromRGB(0, 160, 255),
+    LINE_THICKNESS = 0.25, 
+    SHRINK_AMOUNT = 0.15, 
 }
 
 local Prefs = { 
-	Active = true,
-	TotalMines = 100 -- set this to 0 if your playing on a different board
+    Active = true,
+    TotalMines = 100 
 }
 
 local Memory = {
-	Map = { Grid = {}, Marked = {}, ToFlag = {}, ToClear = {} },
-	Bounds = { X = 0, Z = 0 },
-	Count = -1,
-	Pending = false,
-	Links = {}
+    Map = { Grid = {}, Marked = {}, ToFlag = {}, ToClear = {} },
+    Bounds = { X = 0, Z = 0 },
+    Count = -1,
+    Pending = false,
+    Links = {}
 }
 
 local m_abs, m_floor, m_huge = math.abs, math.floor, math.huge
 local t_sort = table.sort
 
+-- Custom Box function to build individual dynamic edges
+-- Fixes ghosting by using WeldConstraints instead of Anchoring
 local function RefreshBox(obj, mode)
-	if not obj or not obj.part then return end
-	if obj.lastMode == mode then return end
-	obj.lastMode = mode
+    if not obj or not obj.part then return end
+    if obj.lastMode == mode then return end
+    obj.lastMode = mode
 
-	local box = obj.part:FindFirstChild("SolverHighlight")
-	if mode == "none" then
-		if box then box:Destroy() end
-		return
-	end
+    if not obj._dummy then
+        -- Create the visual host
+        local dummy = Instance.new("Part")
+        dummy.Name = "SolverVisual"
+        dummy.Size = obj.part.Size - Vector3.new(Visuals.SHRINK_AMOUNT, 0.05, Visuals.SHRINK_AMOUNT)
+        dummy.CFrame = obj.part.CFrame
+        dummy.Anchored = false -- MUST be false to prevent ghosting/floating
+        dummy.CanCollide = false
+        dummy.Transparency = 1
+        dummy.Massless = true
+        dummy.Parent = obj.part
 
-	if not box then
-		box = Instance.new("SelectionBox")
-		box.Name = "SolverHighlight"
-		box.Parent = obj.part
-		box.Adornee = obj.part
-		box.LineThickness = Visuals.THICK
-		box.SurfaceTransparency = 1 
-	end
-	box.Color3 = (mode == "mine" and Visuals.M_COL) or Visuals.S_COL
-	box.Transparency = 0
+        -- Weld to the tile so it moves WITH the board
+        local weld = Instance.new("WeldConstraint")
+        weld.Part0 = dummy
+        weld.Part1 = obj.part
+        weld.Parent = dummy
+        obj._dummy = dummy
+
+        local edges = {}
+        obj._edges = edges
+
+        local sx, sy, sz = dummy.Size.X, dummy.Size.Y, dummy.Size.Z
+        local r = Visuals.LINE_THICKNESS / 2
+        local lenX, lenZ = sx + Visuals.SHRINK_AMOUNT, sz + Visuals.SHRINK_AMOUNT
+
+        local function makeEdge(name, cf, h)
+            local cyl = Instance.new("CylinderHandleAdornment")
+            cyl.Name = name
+            cyl.Adornee = dummy
+            cyl.Radius = r
+            cyl.Height = h
+            cyl.CFrame = cf
+            cyl.Transparency = 1
+            cyl.ZIndex = 5
+            cyl.AlwaysOnTop = true
+            cyl.Parent = dummy
+            edges[name] = cyl
+        end
+
+        -- Surface-only edges
+        makeEdge("TR", CFrame.new(sx/2, sy/2, 0), lenZ)
+        makeEdge("TL", CFrame.new(-sx/2, sy/2, 0), lenZ)
+        makeEdge("TF", CFrame.new(0, sy/2, sz/2) * CFrame.Angles(0, math.pi/2, 0), lenX)
+        makeEdge("TB", CFrame.new(0, sy/2, -sz/2) * CFrame.Angles(0, math.pi/2, 0), lenX)
+    end
+end
+
+-- Perimeter logic that respects the "Hidden" state to prevent ghosting on numbers
+local function RefreshOutline(unit)
+    if not unit._edges then return end
+
+    -- CRITICAL FIX: If the tile is revealed (not hidden), force all lines to vanish
+    if unit.lastMode == "none" or not unit.hidden then
+        for _, edge in pairs(unit._edges) do
+            edge.Transparency = 1
+        end
+        return
+    end
+
+    local c = unit.lastMode
+    local col = (c == "mine" and Visuals.M_COL) or Visuals.S_COL
+
+    local function isSameGroup(nx, nz)
+        local n = Memory.Map.Grid[nx] and Memory.Map.Grid[nx][nz]
+        -- Only clump if the neighbor is the same mode AND still hidden
+        return n and n.lastMode == c and n.hidden
+    end
+
+    local x, z = unit.ix, unit.iz
+    local r = isSameGroup(x+1, z)
+    local l = isSameGroup(x-1, z)
+    local f = isSameGroup(x, z+1)
+    local b = isSameGroup(x, z-1)
+
+    local function setE(name, show)
+        local e = unit._edges[name]
+        if show then
+            e.Color3 = col
+            e.Transparency = 0
+        else
+            e.Transparency = 1
+        end
+    end
+
+    -- Draw lines only on the outer perimeter of the "clump"
+    setE("TR", not r)
+    setE("TL", not l)
+    setE("TF", not f)
+    setE("TB", not b)
 end
 
 local function BindFolder(target)
-	for _, v in ipairs(Memory.Links) do v:Disconnect() end
-	Memory.Links = {}
-	
-	table.insert(Memory.Links, target.DescendantAdded:Connect(function()
-		if not Memory.Pending then
-			Memory.Pending = true
-		end
-	end))
+    for _, v in ipairs(Memory.Links) do v:Disconnect() end
+    Memory.Links = {}
+    
+    table.insert(Memory.Links, target.ChildAdded:Connect(function() Memory.Pending = true end))
+    table.insert(Memory.Links, target.ChildRemoved:Connect(function() Memory.Pending = true end))
 
-	table.insert(Memory.Links, target.DescendantRemoving:Connect(function()
-		Memory.Pending = true
-	end))
+    for _, child in ipairs(target:GetChildren()) do
+        if child:IsA("BasePart") then
+            table.insert(Memory.Links, child.ChildAdded:Connect(function() Memory.Pending = true end))
+            table.insert(Memory.Links, child.ChildRemoved:Connect(function() Memory.Pending = true end))
+        end
+    end
 end
 
 local function MapOutEnvironment(src)
-	Memory.Map.Grid = {}
-	local items = src:GetChildren()
-	if #items == 0 then return end
+    Memory.Map.Grid = {}
+    local items = src:GetChildren()
+    if #items == 0 then return end
 
-	local raw, xCoords, zCoords = {}, {}, {}
-	for _, p in ipairs(items) do
-		if p:IsA("BasePart") and p.Transparency < 0.5 then
-			table.insert(raw, {obj = p, loc = p.Position})
-			table.insert(xCoords, p.Position.X)
-			table.insert(zCoords, p.Position.Z)
-		end
-	end
-	if #xCoords == 0 then return end
-	t_sort(xCoords) t_sort(zCoords)
+    local raw, xCoords, zCoords = {}, {}, {}
+    for _, p in ipairs(items) do
+        if p:IsA("BasePart") and p.Transparency < 0.5 then
+            table.insert(raw, {obj = p, loc = p.Position})
+            table.insert(xCoords, p.Position.X)
+            table.insert(zCoords, p.Position.Z)
+        end
+    end
+    if #xCoords == 0 then return end
+    t_sort(xCoords) t_sort(zCoords)
 
-	local function Group(set)
-		local res = {}
-		local v, n = set[1], 1
-		for i = 2, #set do
-			if m_abs(set[i] - v) <= 2 then
-				n = n + 1
-				v = v + (set[i] - v) / n
-			else
-				table.insert(res, v)
-				v, n = set[i], 1
-			end
-		end
-		table.insert(res, v)
-		return res
-	end
+    local function Group(set)
+        local res = {}
+        local v, n = set[1], 1
+        for i = 2, #set do
+            if m_abs(set[i] - v) <= 2 then
+                n = n + 1
+                v = v + (set[i] - v) / n
+            else
+                table.insert(res, v)
+                v, n = set[i], 1
+            end
+        end
+        table.insert(res, v)
+        return res
+    end
 
-	local uX, uZ = Group(xCoords), Group(zCoords)
-	Memory.Bounds.X, Memory.Bounds.Z = #uX, #uZ
+    local uX, uZ = Group(xCoords), Group(zCoords)
+    Memory.Bounds.X, Memory.Bounds.Z = #uX, #uZ
 
-	for x = 0, Memory.Bounds.X - 1 do
-		Memory.Map.Grid[x] = {}
-		for z = 0, Memory.Bounds.Z - 1 do
-			Memory.Map.Grid[x][z] = {
-				ix = x, iz = z, adj = {}, status = "unknown", hidden = true
-			}
-		end
-	end
+    for x = 0, Memory.Bounds.X - 1 do
+        Memory.Map.Grid[x] = {}
+        for z = 0, Memory.Bounds.Z - 1 do
+            Memory.Map.Grid[x][z] = {
+                ix = x, iz = z, adj = {}, status = "unknown", hidden = true,
+                _edges = nil, _dummy = nil, lastMode = "none"
+            }
+        end
+    end
 
-	for _, d in ipairs(raw) do
-		local rX, rZ = 1, 1
-		local dX, dZ = m_huge, m_huge
-		for i, v in ipairs(uX) do if m_abs(d.loc.X - v) < dX then dX = m_abs(d.loc.X - v) rX = i end end
-		for i, v in ipairs(uZ) do if m_abs(d.loc.Z - v) < dZ then dZ = m_abs(d.loc.Z - v) rZ = i end end
-		local unit = Memory.Map.Grid[rX-1][rZ-1]
-		unit.part = d.obj
-		unit.pos = d.loc
-	end
+    for _, d in ipairs(raw) do
+        local rX, rZ = 1, 1
+        local dX, dZ = m_huge, m_huge
+        for i, v in ipairs(uX) do if m_abs(d.loc.X - v) < dX then dX = m_abs(d.loc.X - v) rX = i end end
+        for i, v in ipairs(uZ) do if m_abs(d.loc.Z - v) < dZ then dZ = m_abs(d.loc.Z - v) rZ = i end end
+        local unit = Memory.Map.Grid[rX-1][rZ-1]
+        unit.part = d.obj
+        unit.pos = d.loc
+    end
 
-	for x = 0, Memory.Bounds.X - 1 do
-		for z = 0, Memory.Bounds.Z - 1 do
-			local unit = Memory.Map.Grid[x][z]
-			for ox = -1, 1 do
-				for oz = -1, 1 do
-					if not (ox == 0 and oz == 0) then
-						local nx, nz = x + ox, z + oz
-						if Memory.Map.Grid[nx] and Memory.Map.Grid[nx][nz] then
-							table.insert(unit.adj, Memory.Map.Grid[nx][nz])
-						end
-					end
-				end
-			end
-		end
-	end
-	BindFolder(src)
+    for x = 0, Memory.Bounds.X - 1 do
+        for z = 0, Memory.Bounds.Z - 1 do
+            local unit = Memory.Map.Grid[x][z]
+            for ox = -1, 1 do
+                for oz = -1, 1 do
+                    if not (ox == 0 and oz == 0) then
+                        local nx, nz = x + ox, z + oz
+                        if Memory.Map.Grid[nx] and Memory.Map.Grid[nx][nz] then
+                            table.insert(unit.adj, Memory.Map.Grid[nx][nz])
+                        end
+                    end
+                end
+            end
+        end
+    end
+    BindFolder(src)
 end
 
 local function ScanGrid()
-	Memory.Map.Marked = {}
-	for x = 0, Memory.Bounds.X - 1 do
-		for z = 0, Memory.Bounds.Z - 1 do
-			local unit = Memory.Map.Grid[x][z]
-			local p = unit.part
-			if p then
-				local ui = p:FindFirstChild("NumberGui") or p:FindFirstChild("numbergui")
-				if ui then
-					unit.hidden = false
-					unit.status = "number"
-					local lb = ui:FindFirstChildWhichIsA("TextLabel")
-					unit.val = lb and tonumber(lb.Text) or 0
-					table.insert(Memory.Map.Marked, unit)
-				elseif p:FindFirstChild("Flag") or p:FindFirstChild("flag") then
-					unit.status = "flagged"
-				else
-					unit.status = "unknown"
-					unit.hidden = true
-				end
-			end
-		end
-	end
+    Memory.Map.Marked = {}
+    for x = 0, Memory.Bounds.X - 1 do
+        for z = 0, Memory.Bounds.Z - 1 do
+            local unit = Memory.Map.Grid[x][z]
+            local p = unit.part
+            if p then
+                local ui = p:FindFirstChild("NumberGui") or p:FindFirstChild("numbergui")
+                if ui then
+                    unit.hidden = false
+                    unit.status = "number"
+                    local lb = ui:FindFirstChildWhichIsA("TextLabel")
+                    unit.val = lb and tonumber(lb.Text) or 0
+                    table.insert(Memory.Map.Marked, unit)
+                elseif p:FindFirstChild("Flag") or p:FindFirstChild("flag") then
+                    unit.status = "flagged"
+                else
+                    unit.status = "unknown"
+                    unit.hidden = true
+                end
+            end
+        end
+    end
 end
 
--- NEW: Pattern evaluator handling 1-1, 1-2-1, 1-2-2-1 edges
 local function SetLogicSearch(foundMines, toOpen)
-	local changed = false
-	local activeNodes = {}
-	
-	for _, unit in ipairs(Memory.Map.Marked) do
-		local mystery, fCount = {}, 0
-		for _, n in ipairs(unit.adj) do
-			if foundMines[n] or n.status == "flagged" then fCount += 1
-			elseif n.hidden and not toOpen[n] then table.insert(mystery, n) end
-		end
-		
-		local gap = unit.val - fCount
-		if #mystery > 0 then
-			table.insert(activeNodes, {gap = gap, unk = mystery})
-		end
-	end
+    local activeNodes = {}
+    
+    for _, unit in ipairs(Memory.Map.Marked) do
+        local mystery, fCount = {}, 0
+        for _, n in ipairs(unit.adj) do
+            if foundMines[n] or n.status == "flagged" then fCount += 1
+            elseif n.hidden and not toOpen[n] then table.insert(mystery, n) end
+        end
+        local gap = unit.val - fCount
+        if #mystery > 0 then table.insert(activeNodes, {gap = gap, unk = mystery}) end
+    end
 
-	for i = 1, #activeNodes do
-		for j = 1, #activeNodes do
-			if i ~= j then
-				local setA, setB = activeNodes[i], activeNodes[j]
-				
-				local intersect, aOnly, bMap = {}, {}, {}
-				for _, u in ipairs(setB.unk) do bMap[u] = true end
-				for _, u in ipairs(setA.unk) do
-					if bMap[u] then table.insert(intersect, u)
-					else table.insert(aOnly, u) end
-				end
-				
-				if #intersect > 0 then
-					local bOnly, iMap = {}, {}
-					for _, u in ipairs(intersect) do iMap[u] = true end
-					for _, u in ipairs(setB.unk) do
-						if not iMap[u] then table.insert(bOnly, u) end
-					end
-					
-					local maxMinesInIntersect = setA.gap
-					if maxMinesInIntersect > #intersect then maxMinesInIntersect = #intersect end
-					
-					if setB.gap - maxMinesInIntersect == #bOnly and #bOnly > 0 then
-						for _, u in ipairs(bOnly) do
-							if not foundMines[u] then
-								foundMines[u] = true
-								changed = true
-							end
-						end
-					end
-					
-					local minMinesInIntersect = setA.gap - #aOnly
-					if minMinesInIntersect < 0 then minMinesInIntersect = 0 end
-					
-					if setB.gap == minMinesInIntersect and #bOnly > 0 then
-						for _, u in ipairs(bOnly) do
-							if not toOpen[u] then
-								toOpen[u] = true
-								foundMines[u] = false
-								changed = true
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-	return changed
+    for i = 1, #activeNodes do
+        for j = 1, #activeNodes do
+            if i ~= j then
+                local setA, setB = activeNodes[i], activeNodes[j]
+                local intersect, aOnly, bMap = {}, {}, {}
+                for _, u in ipairs(setB.unk) do bMap[u] = true end
+                for _, u in ipairs(setA.unk) do
+                    if bMap[u] then table.insert(intersect, u)
+                    else table.insert(aOnly, u) end
+                end
+                
+                if #intersect > 0 then
+                    local bOnly, iMap = {}, {}
+                    local changed = false
+                    for _, u in ipairs(intersect) do iMap[u] = true end
+                    for _, u in ipairs(setB.unk) do if not iMap[u] then table.insert(bOnly, u) end end
+                    
+                    local maxInI = setA.gap > #intersect and #intersect or setA.gap
+                    if setB.gap - maxInI == #bOnly and #bOnly > 0 then
+                        for _, u in ipairs(bOnly) do 
+                            if not foundMines[u] then 
+                                foundMines[u] = true 
+                                changed = true 
+                            end 
+                        end
+                    end
+                    
+                    local minInI = (setA.gap - #aOnly) < 0 and 0 or (setA.gap - #aOnly)
+                    if setB.gap == minInI and #bOnly > 0 then
+                        for _, u in ipairs(bOnly) do 
+                            if not toOpen[u] then 
+                                toOpen[u] = true 
+                                foundMines[u] = false 
+                                changed = true 
+                            end 
+                        end
+                    end
+                    
+                    if changed then return true end
+                end
+            end
+        end
+    end
+    return false
 end
 
--- ORIGINAL: Your dual solver fallback
 local function DeepSearch(foundMines, toOpen)
-	local edge, active, edgeReg = {}, {}, {}
+    local edge, active, edgeReg = {}, {}, {}
 
-	for _, unit in ipairs(Memory.Map.Marked) do
-		local mystery, fCount = {}, 0
-		for _, n in ipairs(unit.adj) do
-			if foundMines[n] or n.status == "flagged" then fCount += 1
-			elseif n.hidden and not toOpen[n] then table.insert(mystery, n) end
-		end
-		
-		local gap = unit.val - fCount
-		if #mystery > 0 then
-			table.insert(active, {gap = gap, unk = mystery})
-			for _, u in ipairs(mystery) do
-				if not edgeReg[u] then
-					edgeReg[u] = true
-					table.insert(edge, u)
-				end
-			end
-		end
-	end
+    for _, unit in ipairs(Memory.Map.Marked) do
+        local mystery, fCount = {}, 0
+        for _, n in ipairs(unit.adj) do
+            if foundMines[n] or n.status == "flagged" then fCount += 1
+            elseif n.hidden and not toOpen[n] then table.insert(mystery, n) end
+        end
+        
+        local gap = unit.val - fCount
+        if #mystery > 0 then
+            table.insert(active, {gap = gap, unk = mystery})
+            for _, u in ipairs(mystery) do
+                if not edgeReg[u] then
+                    edgeReg[u] = true
+                    table.insert(edge, u)
+                end
+            end
+        end
+    end
 
-	if #edge == 0 then return false end
+    if #edge == 0 then return false end
 
-	local link = {}
-	for _, u in ipairs(edge) do link[u] = {} end
-	
-	for _, a in ipairs(active) do
-		for i = 1, #a.unk do
-			for j = i + 1, #a.unk do
-				link[a.unk[i]][a.unk[j]] = true
-				link[a.unk[j]][a.unk[i]] = true
-			end
-		end
-	end
+    local link = {}
+    for _, u in ipairs(edge) do link[u] = {} end
+    
+    for _, a in ipairs(active) do
+        for i = 1, #a.unk do
+            for j = i + 1, #a.unk do
+                link[a.unk[i]][a.unk[j]] = true
+                link[a.unk[j]][a.unk[i]] = true
+            end
+        end
+    end
 
-	local seen, clusters = {}, {}
-	for _, u in ipairs(edge) do
-		if not seen[u] then
-			local group = {}
-			local stack = {u}
-			seen[u] = true
-			local ptr = 1
-			while ptr <= #stack do
-				local cur = stack[ptr]
-				ptr += 1
-				table.insert(group, cur)
-				for side in pairs(link[cur]) do
-					if not seen[side] then
-						seen[side] = true
-						table.insert(stack, side)
-					end
-				end
-			end
-			table.insert(clusters, group)
-		end
-	end
+    local seen, clusters = {}, {}
+    for _, u in ipairs(edge) do
+        if not seen[u] then
+            local group = {}
+            local stack = {u}
+            seen[u] = true
+            local ptr = 1
+            while ptr <= #stack do
+                local cur = stack[ptr]
+                ptr += 1
+                table.insert(group, cur)
+                for side in pairs(link[cur]) do
+                    if not seen[side] then
+                        seen[side] = true
+                        table.insert(stack, side)
+                    end
+                end
+            end
+            table.insert(clusters, group)
+        end
+    end
 
-	local success = false
-	for _, bundle in ipairs(clusters) do
-	if #bundle > 20 then return false end
-		local bundleNums = {}
-		local bSet = {}
-		for _, c in ipairs(bundle) do bSet[c] = true end
-		
-		for _, a in ipairs(active) do
-			for _, u in ipairs(a.unk) do
-				if bSet[u] then
-					table.insert(bundleNums, a)
-					break
-				end
-			end
-		end
+    local success = false
+    for _, bundle in ipairs(clusters) do
+        if #bundle <= 20 then
+            local bundleNums = {}
+            local bSet = {}
+            for _, c in ipairs(bundle) do bSet[c] = true end
+            
+            for _, a in ipairs(active) do
+                for _, u in ipairs(a.unk) do
+                    if bSet[u] then
+                        table.insert(bundleNums, a)
+                        break
+                    end
+                end
+            end
 
-		local winCount = 0
-		local totalMines = {}
-		for _, c in ipairs(bundle) do totalMines[c] = 0 end
+            local winCount = 0
+            local totalMines = {}
+            for _, c in ipairs(bundle) do totalMines[c] = 0 end
 
-		local function Recursive(step)
-			if step > #bundle then
-				winCount += 1
-				for _, c in ipairs(bundle) do
-					if foundMines[c] == true then totalMines[c] += 1 end
-				end
-				return
-			end
+            local function Recursive(step)
+                if step > #bundle then
+                    winCount += 1
+                    for _, c in ipairs(bundle) do
+                        if foundMines[c] == true then totalMines[c] += 1 end
+                    end
+                    return
+                end
 
-			local target = bundle[step]
+                local target = bundle[step]
+                
+                -- Try Safe
+                foundMines[target] = false
+                local okS = true
+                for _, a in ipairs(bundleNums) do
+                    local pot, cur = 0, 0
+                    for _, u in ipairs(a.unk) do
+                        if foundMines[u] == true then cur += 1
+                        elseif foundMines[u] == nil then pot += 1 end
+                    end
+                    if cur + pot < a.gap then okS = false break end
+                end
+                if okS then Recursive(step + 1) end
 
-			foundMines[target] = false
-			local okS = true
-			for _, a in ipairs(bundleNums) do
-				local pot, cur = 0, 0
-				for _, u in ipairs(a.unk) do
-					if foundMines[u] == true then cur += 1
-					elseif foundMines[u] == nil then pot += 1 end
-				end
-				if cur + pot < a.gap then okS = false break end
-			end
-			if okS then Recursive(step + 1) end
+                -- Try Mine
+                foundMines[target] = true
+                local okM = true
+                for _, a in ipairs(bundleNums) do
+                    local cur = 0
+                    for _, u in ipairs(a.unk) do
+                        if foundMines[u] == true then cur += 1 end
+                    end
+                    if cur > a.gap then okM = false break end
+                end
+                if okM then Recursive(step + 1) end
+                
+                foundMines[target] = nil 
+            end
 
-			foundMines[target] = true
-			local okM = true
-			for _, a in ipairs(bundleNums) do
-				local cur = 0
-				for _, u in ipairs(a.unk) do
-					if foundMines[u] == true then cur += 1 end
-				end
-				if cur > a.gap then okM = false break end
-			end
-			if okM then Recursive(step + 1) end
-			
-			foundMines[target] = nil 
-		end
+            Recursive(1)
 
-		Recursive(1)
+            if winCount > 0 then
+                for _, c in ipairs(bundle) do
+                    if totalMines[c] == winCount then
+                        foundMines[c] = true
+                        success = true
+                    elseif totalMines[c] == 0 then
+                        toOpen[c] = true
+                        foundMines[c] = false 
+                        success = true
+                    else
+                        foundMines[c] = nil 
+                    end
+                end
+            end
+        end
+    end
 
-		if winCount > 0 then
-			for _, c in ipairs(bundle) do
-				if totalMines[c] == winCount then
-					foundMines[c] = true
-					success = true
-				elseif totalMines[c] == 0 then
-					toOpen[c] = true
-					foundMines[c] = false 
-					success = true
-				else
-					foundMines[c] = nil 
-				end
-			end
-		end
-	end
-
-	return success
+    return success
 end
 
 local function Compute()
-	local foundMines = {}
-	local toOpen = Memory.Map.ToClear or {} 
-	
-	for x = 0, Memory.Bounds.X - 1 do
-		for z = 0, Memory.Bounds.Z - 1 do
-			local unit = Memory.Map.Grid[x][z]
-			if not unit.hidden then 
-				toOpen[unit] = nil 
-			end
-			if unit.status == "flagged" or Memory.Map.ToFlag[unit] then 
-				foundMines[unit] = true 
-			end
-		end
-	end
+    local foundMines = {}
+    local toOpen = {} 
+    
+    for x = 0, Memory.Bounds.X - 1 do
+        for z = 0, Memory.Bounds.Z - 1 do
+            local unit = Memory.Map.Grid[x][z]
+            if not unit.hidden then toOpen[unit] = nil 
+            elseif unit.status == "flagged" or (Memory.Map.ToFlag and Memory.Map.ToFlag[unit]) then foundMines[unit] = true end
+        end
+    end
 
-	local act = true
-	while act do
-		act = false
+    local act = true
+    while act do
+        act = false
+        if Prefs.TotalMines and Prefs.TotalMines > 0 then
+            local fCount, unks = 0, {}
+            for x = 0, Memory.Bounds.X - 1 do
+                for z = 0, Memory.Bounds.Z - 1 do
+                    local u = Memory.Map.Grid[x][z]
+                    if foundMines[u] or u.status == "flagged" then fCount += 1
+                    elseif u.hidden and not toOpen[u] then table.insert(unks, u) end
+                end
+            end
+            local rem = Prefs.TotalMines - fCount
+            if rem == #unks and #unks > 0 then for _, u in ipairs(unks) do foundMines[u] = true act = true end
+            elseif rem == 0 and #unks > 0 then for _, u in ipairs(unks) do toOpen[u] = true act = true end end
+        end
 
-		-- Global Mine Count logic integration
-		if Prefs.TotalMines and Prefs.TotalMines > 0 then
-			local flaggedCount = 0
-			local totalUnknowns = {}
-			for x = 0, Memory.Bounds.X - 1 do
-				for z = 0, Memory.Bounds.Z - 1 do
-					local unit = Memory.Map.Grid[x][z]
-					if foundMines[unit] or unit.status == "flagged" then
-						flaggedCount += 1
-					elseif unit.hidden and not toOpen[unit] then
-						table.insert(totalUnknowns, unit)
-					end
-				end
-			end
-			
-			local remaining = Prefs.TotalMines - flaggedCount
-			if remaining == #totalUnknowns and #totalUnknowns > 0 then
-				for _, u in ipairs(totalUnknowns) do
-					if not foundMines[u] then
-						foundMines[u] = true
-						act = true
-					end
-				end
-			elseif remaining == 0 and #totalUnknowns > 0 then
-				for _, u in ipairs(totalUnknowns) do
-					if not toOpen[u] then
-						toOpen[u] = true
-						foundMines[u] = false
-						act = true
-					end
-				end
-			end
-		end
+        for _, unit in ipairs(Memory.Map.Marked) do
+            local mystery, fCount = {}, 0
+            for _, n in ipairs(unit.adj) do
+                if foundMines[n] or n.status == "flagged" then fCount += 1
+                elseif n.hidden and not toOpen[n] then table.insert(mystery, n) end
+            end
+            local left = unit.val - fCount
+            if left == #mystery and left > 0 then
+                for _, u in ipairs(mystery) do if not foundMines[u] then foundMines[u] = true act = true end end
+            elseif left == 0 and #mystery > 0 then
+                for _, u in ipairs(mystery) do if not toOpen[u] then toOpen[u] = true act = true end end
+            end
+        end
 
-		-- Standard Logic
-		for _, unit in ipairs(Memory.Map.Marked) do
-			local mystery, fCount = {}, 0
-			for _, n in ipairs(unit.adj) do
-				if foundMines[n] or n.status == "flagged" then fCount += 1
-				elseif n.hidden and not toOpen[n] then table.insert(mystery, n) end
-			end
-			
-			local left = unit.val - fCount
-			if left == #mystery and left > 0 then
-				for _, u in ipairs(mystery) do 
-					if not foundMines[u] then
-						foundMines[u] = true 
-						act = true 
-					end
-				end
-			elseif left == 0 and #mystery > 0 then
-				for _, u in ipairs(mystery) do 
-					if not toOpen[u] then
-						toOpen[u] = true 
-						foundMines[u] = false 
-						act = true 
-					end
-				end
-			end
-		end
+        if not act then act = SetLogicSearch(foundMines, toOpen) end
+        if not act then act = DeepSearch(foundMines, toOpen) end
+    end
 
-		-- Set Logic (Patterns) Fallback
-		if not act then
-			act = SetLogicSearch(foundMines, toOpen)
-		end
-		
-		-- Dual Solver Fallback
-		if not act then
-			act = DeepSearch(foundMines, toOpen)
-		end
-	end
-
-	local resultFlags = {}
-	for unit, val in pairs(foundMines) do
-		if val == true then resultFlags[unit] = true end
-	end
-	Memory.Map.ToFlag = resultFlags
-	Memory.Map.ToClear = toOpen
+    local resultFlags = {}
+    for unit, val in pairs(foundMines) do if val == true then resultFlags[unit] = true end end
+    Memory.Map.ToFlag = resultFlags
+    Memory.Map.ToClear = toOpen
 end
 
+-- ==========================================
+-- WATERMARK INITIALIZATION
+-- ==========================================
+local function SetupWatermark()
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "FoolifiedWatermark"
+    sg.ResetOnSpawn = false
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0, 200, 0, 24)
+    lbl.Position = UDim2.new(1, -208, 1, -32)
+    lbl.AnchorPoint = Vector2.new(0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = "Made By Foolisher1"
+    lbl.TextColor3 = Color3.new(1, 1, 1)
+    lbl.TextSize = 13
+    lbl.Font = Enum.Font.Code
+    lbl.TextXAlignment = Enum.TextXAlignment.Right
+    lbl.Parent = sg
+
+    local grad = Instance.new("UIGradient")
+    grad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0,   Color3.fromRGB(101,  67,  33)),
+        ColorSequenceKeypoint.new(0.3, Color3.fromRGB(180, 120,  50)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 210, 120)),
+        ColorSequenceKeypoint.new(0.7, Color3.fromRGB(180, 120,  50)),
+        ColorSequenceKeypoint.new(1,   Color3.fromRGB(101,  67,  33)),
+    })
+    grad.Rotation = 0
+    grad.Parent = lbl
+
+    local _t = 0
+    _RS.Heartbeat:Connect(function(dt)
+        _t += dt * 60
+        grad.Offset = Vector2.new(math.sin(math.rad(_t)) * 0.6, 0)
+    end)
+end
+
+SetupWatermark()
+
+-- ==========================================
+-- SOLVER RUNSERVICE LOOP
+-- ==========================================
 _RS.Heartbeat:Connect(function()
-	local folder = _W:FindFirstChild("Flag") and _W.Flag:FindFirstChild("Parts")
-	if not folder or not Prefs.Active then return end
+    local folder = _W:FindFirstChild("Flag") and _W.Flag:FindFirstChild("Parts")
+    if not folder or not Prefs.Active then return end
 
-	if #folder:GetChildren() ~= Memory.Count then
-		Memory.Count = #folder:GetChildren()
-		MapOutEnvironment(folder)
-		Memory.Pending = true
-	end
+    if #folder:GetChildren() ~= Memory.Count then
+        Memory.Count = #folder:GetChildren()
+        MapOutEnvironment(folder)
+        Memory.Pending = true
+    end
 
-	if Memory.Pending then
-		Memory.Pending = false
-		ScanGrid()
-		Compute()
-		
-		for x = 0, Memory.Bounds.X - 1 do
-			for z = 0, Memory.Bounds.Z - 1 do
-				local unit = Memory.Map.Grid[x][z]
-				if unit.part then
-					if Memory.Map.ToFlag[unit] then RefreshBox(unit, "mine")
-					elseif Memory.Map.ToClear[unit] then RefreshBox(unit, "safe")
-					else RefreshBox(unit, "none") end
-				end
-			end
-		end
-	end
+    if Memory.Pending then
+        Memory.Pending = false
+        ScanGrid()
+        Compute()
+        
+        -- Pass 1: Set states & create lines
+        for x = 0, Memory.Bounds.X - 1 do
+            for z = 0, Memory.Bounds.Z - 1 do
+                local unit = Memory.Map.Grid[x][z]
+                if unit.part then
+                    if Memory.Map.ToFlag[unit] then RefreshBox(unit, "mine")
+                    elseif Memory.Map.ToClear[unit] then RefreshBox(unit, "safe")
+                    else RefreshBox(unit, "none") end
+                end
+            end
+        end
+        
+        -- Pass 2: Toggle internal/external line visibilities based on neighbors
+        for x = 0, Memory.Bounds.X - 1 do
+            for z = 0, Memory.Bounds.Z - 1 do
+                local unit = Memory.Map.Grid[x][z]
+                if unit.part then
+                    RefreshOutline(unit)
+                end
+            end
+        end
+    end
 end)

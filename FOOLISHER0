@@ -1,575 +1,1035 @@
+if type(_G.__SweeperCleanup) == "function" then
+	pcall(_G.__SweeperCleanup)
+end
+
 local _W = game:GetService("Workspace")
 local _RS = game:GetService("RunService")
 local _P = game:GetService("Players")
-local _UI = game:GetService("UserInputService")
-local LocalPlayer = _P.LocalPlayer -- Required for the watermark
+local _UIS = game:GetService("UserInputService")
+local LocalPlayer = _P.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+for _, name in ipairs({ "FoolifiedWatermark", "SweeperUI" }) do
+	local old = PlayerGui:FindFirstChild(name)
+	if old then old:Destroy() end
+end
+
+local IS_TOUCH = _UIS.TouchEnabled and not _UIS.MouseEnabled
 
 local Visuals = {
-    M_COL = Color3.fromRGB(255, 40, 40),
-    S_COL = Color3.fromRGB(0, 160, 255),
-    LINE_THICKNESS = 0.25, 
-    SHRINK_AMOUNT = 0.15, 
+	M_COL = Color3.fromRGB(255, 40, 40),
+	S_COL = Color3.fromRGB(0, 160, 255),
+	LINE_THICKNESS = 0.25,
+	SHRINK_AMOUNT = 0.15,
 }
 
-local Prefs = { 
-    Active = true,
-    TotalMines = 100 
+local Prefs = {
+	Active = true,
+	TotalMines = 100,
+	MaxCluster = 12,
+	ToggleKey = Enum.KeyCode.RightShift,
 }
 
 local Memory = {
-    Map = { Grid = {}, Marked = {}, ToFlag = {}, ToClear = {} },
-    Bounds = { X = 0, Z = 0 },
-    Count = -1,
-    Pending = false,
-    Links = {}
+	Folder = nil,
+	Rebuild = true,
+	DirtyUnits = {},
+	Links = {},
+	Grid = {},
+	Units = {},
+	NumberSet = {},
+	Numbers = {},
+	Mine = {},
+	Safe = {},
 }
 
-local m_abs, m_floor, m_huge = math.abs, math.floor, math.huge
-local t_sort = table.sort
+local Stats = { mines = 0, safe = 0, ms = nil }
+local Running = {}
+local UpdateStats = function() end
 
--- Custom Box function to build individual dynamic edges
--- Fixes ghosting by using WeldConstraints instead of Anchoring
-local function RefreshBox(obj, mode)
-    if not obj or not obj.part then return end
-    if obj.lastMode == mode then return end
-    obj.lastMode = mode
+local EDGE_OFFSETS = {
+	TR = { 1, 0 },
+	TL = { -1, 0 },
+	TF = { 0, 1 },
+	TB = { 0, -1 },
+}
 
-    if not obj._dummy then
-        -- Create the visual host
-        local dummy = Instance.new("Part")
-        dummy.Name = "SolverVisual"
-        dummy.Size = obj.part.Size - Vector3.new(Visuals.SHRINK_AMOUNT, 0.05, Visuals.SHRINK_AMOUNT)
-        dummy.CFrame = obj.part.CFrame
-        dummy.Anchored = false -- MUST be false to prevent ghosting/floating
-        dummy.CanCollide = false
-        dummy.Transparency = 1
-        dummy.Massless = true
-        dummy.Parent = obj.part
-
-        -- Weld to the tile so it moves WITH the board
-        local weld = Instance.new("WeldConstraint")
-        weld.Part0 = dummy
-        weld.Part1 = obj.part
-        weld.Parent = dummy
-        obj._dummy = dummy
-
-        local edges = {}
-        obj._edges = edges
-
-        local sx, sy, sz = dummy.Size.X, dummy.Size.Y, dummy.Size.Z
-        local r = Visuals.LINE_THICKNESS / 2
-        local lenX, lenZ = sx + Visuals.SHRINK_AMOUNT, sz + Visuals.SHRINK_AMOUNT
-
-        local function makeEdge(name, cf, h)
-            local cyl = Instance.new("CylinderHandleAdornment")
-            cyl.Name = name
-            cyl.Adornee = dummy
-            cyl.Radius = r
-            cyl.Height = h
-            cyl.CFrame = cf
-            cyl.Transparency = 1
-            cyl.ZIndex = 5
-            cyl.AlwaysOnTop = true
-            cyl.Parent = dummy
-            edges[name] = cyl
-        end
-
-        -- Surface-only edges
-        makeEdge("TR", CFrame.new(sx/2, sy/2, 0), lenZ)
-        makeEdge("TL", CFrame.new(-sx/2, sy/2, 0), lenZ)
-        makeEdge("TF", CFrame.new(0, sy/2, sz/2) * CFrame.Angles(0, math.pi/2, 0), lenX)
-        makeEdge("TB", CFrame.new(0, sy/2, -sz/2) * CFrame.Angles(0, math.pi/2, 0), lenX)
-    end
+-- Hidden tiles are green; revealed tiles change color.
+local function looksHidden(part)
+	if part.Transparency >= 0.5 then return false end
+	local c = part.Color
+	return c.G > c.R and c.G > c.B
 end
 
--- Perimeter logic that respects the "Hidden" state to prevent ghosting on numbers
-local function RefreshOutline(unit)
-    if not unit._edges then return end
-
-    -- CRITICAL FIX: If the tile is revealed (not hidden), force all lines to vanish
-    if unit.lastMode == "none" or not unit.hidden then
-        for _, edge in pairs(unit._edges) do
-            edge.Transparency = 1
-        end
-        return
-    end
-
-    local c = unit.lastMode
-    local col = (c == "mine" and Visuals.M_COL) or Visuals.S_COL
-
-    local function isSameGroup(nx, nz)
-        local n = Memory.Map.Grid[nx] and Memory.Map.Grid[nx][nz]
-        -- Only clump if the neighbor is the same mode AND still hidden
-        return n and n.lastMode == c and n.hidden
-    end
-
-    local x, z = unit.ix, unit.iz
-    local r = isSameGroup(x+1, z)
-    local l = isSameGroup(x-1, z)
-    local f = isSameGroup(x, z+1)
-    local b = isSameGroup(x, z-1)
-
-    local function setE(name, show)
-        local e = unit._edges[name]
-        if show then
-            e.Color3 = col
-            e.Transparency = 0
-        else
-            e.Transparency = 1
-        end
-    end
-
-    -- Draw lines only on the outer perimeter of the "clump"
-    setE("TR", not r)
-    setE("TL", not l)
-    setE("TF", not f)
-    setE("TB", not b)
+local function At(x, z)
+	local col = Memory.Grid[x]
+	return col and col[z]
 end
 
-local function BindFolder(target)
-    for _, v in ipairs(Memory.Links) do v:Disconnect() end
-    Memory.Links = {}
-    
-    table.insert(Memory.Links, target.ChildAdded:Connect(function() Memory.Pending = true end))
-    table.insert(Memory.Links, target.ChildRemoved:Connect(function() Memory.Pending = true end))
-
-    for _, child in ipairs(target:GetChildren()) do
-        if child:IsA("BasePart") then
-            table.insert(Memory.Links, child.ChildAdded:Connect(function() Memory.Pending = true end))
-            table.insert(Memory.Links, child.ChildRemoved:Connect(function() Memory.Pending = true end))
-        end
-    end
+local function Link(signal, fn)
+	table.insert(Memory.Links, signal:Connect(fn))
 end
 
-local function MapOutEnvironment(src)
-    Memory.Map.Grid = {}
-    local items = src:GetChildren()
-    if #items == 0 then return end
+--------------------------------------------------------------------
+-- VISUALS
+--------------------------------------------------------------------
+local function EnsureEdges(unit)
+	if unit.edges then return end
+	local part = unit.part
 
-    local raw, xCoords, zCoords = {}, {}, {}
-    for _, p in ipairs(items) do
-        if p:IsA("BasePart") and p.Transparency < 0.5 then
-            table.insert(raw, {obj = p, loc = p.Position})
-            table.insert(xCoords, p.Position.X)
-            table.insert(zCoords, p.Position.Z)
-        end
-    end
-    if #xCoords == 0 then return end
-    t_sort(xCoords) t_sort(zCoords)
+	local dummy = Instance.new("Part")
+	dummy.Name = "SolverVisual"
+	dummy.Size = part.Size - Vector3.new(Visuals.SHRINK_AMOUNT, 0.05, Visuals.SHRINK_AMOUNT)
+	dummy.CFrame = part.CFrame
+	dummy.Anchored = false
+	dummy.CanCollide = false
+	dummy.CanQuery = false
+	dummy.CanTouch = false
+	dummy.CastShadow = false
+	dummy.Transparency = 1
+	dummy.Massless = true
 
-    local function Group(set)
-        local res = {}
-        local v, n = set[1], 1
-        for i = 2, #set do
-            if m_abs(set[i] - v) <= 2 then
-                n = n + 1
-                v = v + (set[i] - v) / n
-            else
-                table.insert(res, v)
-                v, n = set[i], 1
-            end
-        end
-        table.insert(res, v)
-        return res
-    end
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = dummy
+	weld.Part1 = part
+	weld.Parent = dummy
 
-    local uX, uZ = Group(xCoords), Group(zCoords)
-    Memory.Bounds.X, Memory.Bounds.Z = #uX, #uZ
+	local edges = {}
+	local sx, sy, sz = dummy.Size.X, dummy.Size.Y, dummy.Size.Z
+	local r = Visuals.LINE_THICKNESS / 2
+	local lenX, lenZ = sx + Visuals.SHRINK_AMOUNT, sz + Visuals.SHRINK_AMOUNT
 
-    for x = 0, Memory.Bounds.X - 1 do
-        Memory.Map.Grid[x] = {}
-        for z = 0, Memory.Bounds.Z - 1 do
-            Memory.Map.Grid[x][z] = {
-                ix = x, iz = z, adj = {}, status = "unknown", hidden = true,
-                _edges = nil, _dummy = nil, lastMode = "none"
-            }
-        end
-    end
+	local function makeEdge(name, cf, h)
+		local cyl = Instance.new("CylinderHandleAdornment")
+		cyl.Name = name
+		cyl.Adornee = dummy
+		cyl.Radius = r
+		cyl.Height = h
+		cyl.CFrame = cf
+		cyl.Transparency = 1
+		cyl.ZIndex = 5
+		cyl.AlwaysOnTop = true
+		cyl.Parent = dummy
+		edges[name] = cyl
+	end
 
-    for _, d in ipairs(raw) do
-        local rX, rZ = 1, 1
-        local dX, dZ = m_huge, m_huge
-        for i, v in ipairs(uX) do if m_abs(d.loc.X - v) < dX then dX = m_abs(d.loc.X - v) rX = i end end
-        for i, v in ipairs(uZ) do if m_abs(d.loc.Z - v) < dZ then dZ = m_abs(d.loc.Z - v) rZ = i end end
-        local unit = Memory.Map.Grid[rX-1][rZ-1]
-        unit.part = d.obj
-        unit.pos = d.loc
-    end
+	makeEdge("TR", CFrame.new(sx / 2, sy / 2, 0), lenZ)
+	makeEdge("TL", CFrame.new(-sx / 2, sy / 2, 0), lenZ)
+	makeEdge("TF", CFrame.new(0, sy / 2, sz / 2) * CFrame.Angles(0, math.pi / 2, 0), lenX)
+	makeEdge("TB", CFrame.new(0, sy / 2, -sz / 2) * CFrame.Angles(0, math.pi / 2, 0), lenX)
 
-    for x = 0, Memory.Bounds.X - 1 do
-        for z = 0, Memory.Bounds.Z - 1 do
-            local unit = Memory.Map.Grid[x][z]
-            for ox = -1, 1 do
-                for oz = -1, 1 do
-                    if not (ox == 0 and oz == 0) then
-                        local nx, nz = x + ox, z + oz
-                        if Memory.Map.Grid[nx] and Memory.Map.Grid[nx][nz] then
-                            table.insert(unit.adj, Memory.Map.Grid[nx][nz])
-                        end
-                    end
-                end
-            end
-        end
-    end
-    BindFolder(src)
+	dummy.Parent = part
+
+	unit.dummy = dummy
+	unit.edges = edges
+	unit.shown = {}
 end
 
-local function ScanGrid()
-    Memory.Map.Marked = {}
-    for x = 0, Memory.Bounds.X - 1 do
-        for z = 0, Memory.Bounds.Z - 1 do
-            local unit = Memory.Map.Grid[x][z]
-            local p = unit.part
-            if p then
-                local ui = p:FindFirstChild("NumberGui") or p:FindFirstChild("numbergui")
-                if ui then
-                    unit.hidden = false
-                    unit.status = "number"
-                    local lb = ui:FindFirstChildWhichIsA("TextLabel")
-                    unit.val = lb and tonumber(lb.Text) or 0
-                    table.insert(Memory.Map.Marked, unit)
-                elseif p:FindFirstChild("Flag") or p:FindFirstChild("flag") then
-                    unit.status = "flagged"
-                else
-                    unit.status = "unknown"
-                    unit.hidden = true
-                end
-            end
-        end
-    end
+local function UpdateEdges(unit)
+	local mode = unit.mode
+	local x, z = unit.ix, unit.iz
+	for name, edge in pairs(unit.edges) do
+		local o = EDGE_OFFSETS[name]
+		local n = At(x + o[1], z + o[2])
+		local want = nil
+		if mode ~= "none" and not (n and n.mode == mode) then
+			want = mode
+		end
+		if unit.shown[name] ~= want then
+			unit.shown[name] = want
+			if want then
+				edge.Color3 = (want == "mine") and Visuals.M_COL or Visuals.S_COL
+				edge.Transparency = 0
+			else
+				edge.Transparency = 1
+			end
+		end
+	end
 end
 
-local function SetLogicSearch(foundMines, toOpen)
-    local activeNodes = {}
-    
-    for _, unit in ipairs(Memory.Map.Marked) do
-        local mystery, fCount = {}, 0
-        for _, n in ipairs(unit.adj) do
-            if foundMines[n] or n.status == "flagged" then fCount += 1
-            elseif n.hidden and not toOpen[n] then table.insert(mystery, n) end
-        end
-        local gap = unit.val - fCount
-        if #mystery > 0 then table.insert(activeNodes, {gap = gap, unk = mystery}) end
-    end
-
-    for i = 1, #activeNodes do
-        for j = 1, #activeNodes do
-            if i ~= j then
-                local setA, setB = activeNodes[i], activeNodes[j]
-                local intersect, aOnly, bMap = {}, {}, {}
-                for _, u in ipairs(setB.unk) do bMap[u] = true end
-                for _, u in ipairs(setA.unk) do
-                    if bMap[u] then table.insert(intersect, u)
-                    else table.insert(aOnly, u) end
-                end
-                
-                if #intersect > 0 then
-                    local bOnly, iMap = {}, {}
-                    local changed = false
-                    for _, u in ipairs(intersect) do iMap[u] = true end
-                    for _, u in ipairs(setB.unk) do if not iMap[u] then table.insert(bOnly, u) end end
-                    
-                    local maxInI = setA.gap > #intersect and #intersect or setA.gap
-                    if setB.gap - maxInI == #bOnly and #bOnly > 0 then
-                        for _, u in ipairs(bOnly) do 
-                            if not foundMines[u] then 
-                                foundMines[u] = true 
-                                changed = true 
-                            end 
-                        end
-                    end
-                    
-                    local minInI = (setA.gap - #aOnly) < 0 and 0 or (setA.gap - #aOnly)
-                    if setB.gap == minInI and #bOnly > 0 then
-                        for _, u in ipairs(bOnly) do 
-                            if not toOpen[u] then 
-                                toOpen[u] = true 
-                                foundMines[u] = false 
-                                changed = true 
-                            end 
-                        end
-                    end
-                    
-                    if changed then return true end
-                end
-            end
-        end
-    end
-    return false
+local function Draw()
+	for _, unit in ipairs(Memory.Units) do
+		local mode = "none"
+		if unit.part and unit.hidden then
+			if Memory.Mine[unit] then
+				mode = "mine"
+			elseif Memory.Safe[unit] then
+				mode = "safe"
+			end
+		end
+		unit.mode = mode
+		if mode ~= "none" then EnsureEdges(unit) end
+	end
+	for _, unit in ipairs(Memory.Units) do
+		if unit.edges then UpdateEdges(unit) end
+	end
 end
 
-local function DeepSearch(foundMines, toOpen)
-    local edge, active, edgeReg = {}, {}, {}
+local function HideAll()
+	for _, unit in ipairs(Memory.Units) do
+		unit.mode = "none"
+		if unit.edges then UpdateEdges(unit) end
+	end
+end
 
-    for _, unit in ipairs(Memory.Map.Marked) do
-        local mystery, fCount = {}, 0
-        for _, n in ipairs(unit.adj) do
-            if foundMines[n] or n.status == "flagged" then fCount += 1
-            elseif n.hidden and not toOpen[n] then table.insert(mystery, n) end
-        end
-        
-        local gap = unit.val - fCount
-        if #mystery > 0 then
-            table.insert(active, {gap = gap, unk = mystery})
-            for _, u in ipairs(mystery) do
-                if not edgeReg[u] then
-                    edgeReg[u] = true
-                    table.insert(edge, u)
-                end
-            end
-        end
-    end
+--------------------------------------------------------------------
+-- GRID
+--------------------------------------------------------------------
+local function ResetBoard()
+	for _, c in ipairs(Memory.Links) do c:Disconnect() end
+	Memory.Links = {}
+	for _, unit in ipairs(Memory.Units) do
+		if unit.dummy then unit.dummy:Destroy() end
+	end
+	Memory.Folder = nil
+	Memory.DirtyUnits = {}
+	Memory.Grid, Memory.Units = {}, {}
+	Memory.NumberSet, Memory.Numbers = {}, {}
+	Memory.Mine, Memory.Safe = {}, {}
+	Stats.mines, Stats.safe, Stats.ms = 0, 0, nil
+end
 
-    if #edge == 0 then return false end
+local function MinStep(values)
+	table.sort(values)
+	local step = math.huge
+	for i = 2, #values do
+		local d = values[i] - values[i - 1]
+		if d > 0.1 and d < step then step = d end
+	end
+	return step
+end
 
-    local link = {}
-    for _, u in ipairs(edge) do link[u] = {} end
-    
-    for _, a in ipairs(active) do
-        for i = 1, #a.unk do
-            for j = i + 1, #a.unk do
-                link[a.unk[i]][a.unk[j]] = true
-                link[a.unk[j]][a.unk[i]] = true
-            end
-        end
-    end
+local function BuildGrid(folder)
+	ResetBoard()
+	Memory.Folder = folder
+	Memory.Rebuild = false
 
-    local seen, clusters = {}, {}
-    for _, u in ipairs(edge) do
-        if not seen[u] then
-            local group = {}
-            local stack = {u}
-            seen[u] = true
-            local ptr = 1
-            while ptr <= #stack do
-                local cur = stack[ptr]
-                ptr += 1
-                table.insert(group, cur)
-                for side in pairs(link[cur]) do
-                    if not seen[side] then
-                        seen[side] = true
-                        table.insert(stack, side)
-                    end
-                end
-            end
-            table.insert(clusters, group)
-        end
-    end
+	local function markRebuild() Memory.Rebuild = true end
+	Link(folder.ChildAdded, markRebuild)
+	Link(folder.ChildRemoved, markRebuild)
 
-    local success = false
-    for _, bundle in ipairs(clusters) do
-        if #bundle <= 20 then
-            local bundleNums = {}
-            local bSet = {}
-            for _, c in ipairs(bundle) do bSet[c] = true end
-            
-            for _, a in ipairs(active) do
-                for _, u in ipairs(a.unk) do
-                    if bSet[u] then
-                        table.insert(bundleNums, a)
-                        break
-                    end
-                end
-            end
+	local parts, xs, zs = {}, {}, {}
+	for _, p in ipairs(folder:GetChildren()) do
+		if p:IsA("BasePart") then
+			local old = p:FindFirstChild("SolverVisual")
+			if old then old:Destroy() end
+			table.insert(parts, p)
+			table.insert(xs, p.Position.X)
+			table.insert(zs, p.Position.Z)
+		end
+	end
+	if #parts == 0 then return end
 
-            local winCount = 0
-            local totalMines = {}
-            for _, c in ipairs(bundle) do totalMines[c] = 0 end
+	local stepX, stepZ = MinStep(xs), MinStep(zs)
+	local minX, minZ = xs[1], zs[1]
 
-            local function Recursive(step)
-                if step > #bundle then
-                    winCount += 1
-                    for _, c in ipairs(bundle) do
-                        if foundMines[c] == true then totalMines[c] += 1 end
-                    end
-                    return
-                end
+	local sizeX, sizeZ = 0, 0
+	local placement = {}
+	for _, p in ipairs(parts) do
+		local ix = math.floor((p.Position.X - minX) / stepX + 0.5)
+		local iz = math.floor((p.Position.Z - minZ) / stepZ + 0.5)
+		placement[p] = { ix, iz }
+		sizeX = math.max(sizeX, ix + 1)
+		sizeZ = math.max(sizeZ, iz + 1)
+	end
 
-                local target = bundle[step]
-                
-                -- Try Safe
-                foundMines[target] = false
-                local okS = true
-                for _, a in ipairs(bundleNums) do
-                    local pot, cur = 0, 0
-                    for _, u in ipairs(a.unk) do
-                        if foundMines[u] == true then cur += 1
-                        elseif foundMines[u] == nil then pot += 1 end
-                    end
-                    if cur + pot < a.gap then okS = false break end
-                end
-                if okS then Recursive(step + 1) end
+	for x = 0, sizeX - 1 do
+		Memory.Grid[x] = {}
+		for z = 0, sizeZ - 1 do
+			local unit = { ix = x, iz = z, adj = {}, hidden = false, mode = "none" }
+			Memory.Grid[x][z] = unit
+			table.insert(Memory.Units, unit)
+		end
+	end
 
-                -- Try Mine
-                foundMines[target] = true
-                local okM = true
-                for _, a in ipairs(bundleNums) do
-                    local cur = 0
-                    for _, u in ipairs(a.unk) do
-                        if foundMines[u] == true then cur += 1 end
-                    end
-                    if cur > a.gap then okM = false break end
-                end
-                if okM then Recursive(step + 1) end
-                
-                foundMines[target] = nil 
-            end
+	for p, pos in pairs(placement) do
+		local unit = Memory.Grid[pos[1]][pos[2]]
+		unit.part = p
+		Memory.DirtyUnits[unit] = true
 
-            Recursive(1)
+		local function onChild(child)
+			if child.Name ~= "SolverVisual" then
+				Memory.DirtyUnits[unit] = true
+			end
+		end
+		Link(p.ChildAdded, onChild)
+		Link(p.ChildRemoved, onChild)
+	end
 
-            if winCount > 0 then
-                for _, c in ipairs(bundle) do
-                    if totalMines[c] == winCount then
-                        foundMines[c] = true
-                        success = true
-                    elseif totalMines[c] == 0 then
-                        toOpen[c] = true
-                        foundMines[c] = false 
-                        success = true
-                    else
-                        foundMines[c] = nil 
-                    end
-                end
-            end
-        end
-    end
+	for _, unit in ipairs(Memory.Units) do
+		for ox = -1, 1 do
+			for oz = -1, 1 do
+				if ox ~= 0 or oz ~= 0 then
+					local n = At(unit.ix + ox, unit.iz + oz)
+					if n then table.insert(unit.adj, n) end
+				end
+			end
+		end
+	end
+end
 
-    return success
+local function WatchNumberGui(unit, gui, label)
+	local function markDirty() Memory.DirtyUnits[unit] = true end
+	if unit.watchedGui ~= gui then
+		unit.watchedGui = gui
+		Link(gui.DescendantAdded, markDirty)
+	end
+	if label and unit.watchedLabel ~= label then
+		unit.watchedLabel = label
+		Link(label:GetPropertyChangedSignal("Text"), markDirty)
+	end
+end
+
+local function ScanUnit(unit)
+	local p = unit.part
+	local state, val, hidden = nil, nil, false
+
+	local gui = p:FindFirstChild("NumberGui") or p:FindFirstChild("numbergui")
+	if gui then
+		local label = gui:FindFirstChildWhichIsA("TextLabel", true)
+		WatchNumberGui(unit, gui, label)
+		val = label and tonumber(label.Text)
+		state = val or "R"
+	elseif looksHidden(p) then
+		hidden = true
+		state = "H"
+	else
+		state = "R"
+	end
+
+	unit.hidden, unit.val = hidden, val
+	Memory.NumberSet[unit] = val and true or nil
+
+	local changed = state ~= unit.state
+	unit.state = state
+	return changed
+end
+
+--------------------------------------------------------------------
+-- SOLVER
+--------------------------------------------------------------------
+local function BuildConstraints(mine, safe)
+	local list, cellCons = {}, {}
+	for _, unit in ipairs(Memory.Numbers) do
+		local cells, known = {}, 0
+		for _, n in ipairs(unit.adj) do
+			if n.hidden then
+				if mine[n] then
+					known += 1
+				elseif not safe[n] then
+					table.insert(cells, n)
+				end
+			end
+		end
+		local need = unit.val - known
+		if #cells > 0 and need >= 0 and need <= #cells then
+			local c = { need = need, cells = cells, set = {} }
+			for _, u in ipairs(cells) do
+				c.set[u] = true
+				local t = cellCons[u]
+				if not t then
+					t = {}
+					cellCons[u] = t
+				end
+				table.insert(t, c)
+			end
+			table.insert(list, c)
+		end
+	end
+	return list, cellCons
+end
+
+local function GlobalPass(mine, safe)
+	if not Prefs.TotalMines then return false end
+	local known, unknown = 0, {}
+	for _, unit in ipairs(Memory.Units) do
+		if unit.hidden then
+			if mine[unit] then
+				known += 1
+			elseif not safe[unit] then
+				table.insert(unknown, unit)
+			end
+		end
+	end
+	local left = Prefs.TotalMines - known
+	if #unknown == 0 then return false end
+	if left == 0 then
+		for _, u in ipairs(unknown) do safe[u] = true end
+		return true
+	elseif left == #unknown then
+		for _, u in ipairs(unknown) do mine[u] = true end
+		return true
+	end
+	return false
+end
+
+local function BasicPass(list, mine, safe)
+	local changed = false
+	for _, c in ipairs(list) do
+		if c.need == 0 then
+			for _, u in ipairs(c.cells) do safe[u] = true end
+			changed = true
+		elseif c.need == #c.cells then
+			for _, u in ipairs(c.cells) do mine[u] = true end
+			changed = true
+		end
+	end
+	return changed
+end
+
+local function SubsetPass(list, cellCons, mine, safe)
+	local changed = false
+	for _, a in ipairs(list) do
+		local checked = {}
+		for _, u in ipairs(a.cells) do
+			for _, b in ipairs(cellCons[u]) do
+				if b ~= a and not checked[b] then
+					checked[b] = true
+
+					local shared = 0
+					for _, v in ipairs(b.cells) do
+						if a.set[v] then shared += 1 end
+					end
+					local bOnly = #b.cells - shared
+
+					if bOnly > 0 then
+						local aOnly = #a.cells - shared
+						local maxShared = math.min(a.need, shared)
+						local minShared = math.max(0, a.need - aOnly)
+						local allMines = (b.need - maxShared == bOnly)
+						local allSafe = (b.need == minShared)
+
+						if allMines or allSafe then
+							for _, v in ipairs(b.cells) do
+								if not a.set[v] then
+									if allMines then mine[v] = true else safe[v] = true end
+								end
+							end
+							changed = true
+						end
+					end
+				end
+			end
+		end
+	end
+	return changed
+end
+
+local function SolveCluster(cluster, cellCons, mine, safe)
+	local assign, counts, solutions = {}, {}, 0
+	for _, u in ipairs(cluster) do counts[u] = 0 end
+
+	local function valid(u)
+		for _, c in ipairs(cellCons[u]) do
+			local m, open = 0, 0
+			for _, v in ipairs(c.cells) do
+				local a = assign[v]
+				if a == 1 then
+					m += 1
+				elseif a == nil then
+					open += 1
+				end
+			end
+			if m > c.need or m + open < c.need then return false end
+		end
+		return true
+	end
+
+	local function search(i)
+		if i > #cluster then
+			solutions += 1
+			for _, u in ipairs(cluster) do
+				if assign[u] == 1 then counts[u] += 1 end
+			end
+			return
+		end
+		local u = cluster[i]
+		assign[u] = 0
+		if valid(u) then search(i + 1) end
+		assign[u] = 1
+		if valid(u) then search(i + 1) end
+		assign[u] = nil
+	end
+
+	search(1)
+	if solutions == 0 then return false end
+
+	local changed = false
+	for _, u in ipairs(cluster) do
+		if counts[u] == solutions then
+			mine[u] = true
+			changed = true
+		elseif counts[u] == 0 then
+			safe[u] = true
+			changed = true
+		end
+	end
+	return changed
+end
+
+local function EnumeratePass(list, cellCons, mine, safe)
+	local seen, changed = {}, false
+	for _, c0 in ipairs(list) do
+		local start = c0.cells[1]
+		if not seen[start] then
+			local cluster, consSeen = {}, {}
+			local stack = { start }
+			seen[start] = true
+			while #stack > 0 do
+				local u = table.remove(stack)
+				table.insert(cluster, u)
+				for _, c in ipairs(cellCons[u]) do
+					if not consSeen[c] then
+						consSeen[c] = true
+						for _, v in ipairs(c.cells) do
+							if not seen[v] then
+								seen[v] = true
+								table.insert(stack, v)
+							end
+						end
+					end
+				end
+			end
+
+			if #cluster <= Prefs.MaxCluster and SolveCluster(cluster, cellCons, mine, safe) then
+				changed = true
+			end
+		end
+	end
+	return changed
 end
 
 local function Compute()
-    local foundMines = {}
-    local toOpen = {} 
-    
-    for x = 0, Memory.Bounds.X - 1 do
-        for z = 0, Memory.Bounds.Z - 1 do
-            local unit = Memory.Map.Grid[x][z]
-            if not unit.hidden then toOpen[unit] = nil 
-            elseif unit.status == "flagged" or (Memory.Map.ToFlag and Memory.Map.ToFlag[unit]) then foundMines[unit] = true end
-        end
-    end
+	local numbers = {}
+	for unit in pairs(Memory.NumberSet) do table.insert(numbers, unit) end
+	Memory.Numbers = numbers
 
-    local act = true
-    while act do
-        act = false
-        if Prefs.TotalMines and Prefs.TotalMines > 0 then
-            local fCount, unks = 0, {}
-            for x = 0, Memory.Bounds.X - 1 do
-                for z = 0, Memory.Bounds.Z - 1 do
-                    local u = Memory.Map.Grid[x][z]
-                    if foundMines[u] or u.status == "flagged" then fCount += 1
-                    elseif u.hidden and not toOpen[u] then table.insert(unks, u) end
-                end
-            end
-            local rem = Prefs.TotalMines - fCount
-            if rem == #unks and #unks > 0 then for _, u in ipairs(unks) do foundMines[u] = true act = true end
-            elseif rem == 0 and #unks > 0 then for _, u in ipairs(unks) do toOpen[u] = true act = true end end
-        end
+	local mine, safe = {}, {}
+	while true do
+		local list, cellCons = BuildConstraints(mine, safe)
+		local progressed = GlobalPass(mine, safe)
+			or BasicPass(list, mine, safe)
+			or SubsetPass(list, cellCons, mine, safe)
+			or EnumeratePass(list, cellCons, mine, safe)
+		if not progressed then break end
+	end
 
-        for _, unit in ipairs(Memory.Map.Marked) do
-            local mystery, fCount = {}, 0
-            for _, n in ipairs(unit.adj) do
-                if foundMines[n] or n.status == "flagged" then fCount += 1
-                elseif n.hidden and not toOpen[n] then table.insert(mystery, n) end
-            end
-            local left = unit.val - fCount
-            if left == #mystery and left > 0 then
-                for _, u in ipairs(mystery) do if not foundMines[u] then foundMines[u] = true act = true end end
-            elseif left == 0 and #mystery > 0 then
-                for _, u in ipairs(mystery) do if not toOpen[u] then toOpen[u] = true act = true end end
-            end
-        end
-
-        if not act then act = SetLogicSearch(foundMines, toOpen) end
-        if not act then act = DeepSearch(foundMines, toOpen) end
-    end
-
-    local resultFlags = {}
-    for unit, val in pairs(foundMines) do if val == true then resultFlags[unit] = true end end
-    Memory.Map.ToFlag = resultFlags
-    Memory.Map.ToClear = toOpen
+	local m, s = 0, 0
+	for _ in pairs(mine) do m += 1 end
+	for _ in pairs(safe) do s += 1 end
+	Stats.mines, Stats.safe = m, s
+	Memory.Mine, Memory.Safe = mine, safe
 end
 
--- ==========================================
--- WATERMARK INITIALIZATION
--- ==========================================
-local function SetupWatermark()
-    local sg = Instance.new("ScreenGui")
-    sg.Name = "FoolifiedWatermark"
-    sg.ResetOnSpawn = false
-    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    sg.Parent = LocalPlayer:WaitForChild("PlayerGui")
-
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(0, 200, 0, 24)
-    lbl.Position = UDim2.new(1, -208, 1, -32)
-    lbl.AnchorPoint = Vector2.new(0, 0)
-    lbl.BackgroundTransparency = 1
-    lbl.Text = "Made By Foolisher1"
-    lbl.TextColor3 = Color3.new(1, 1, 1)
-    lbl.TextSize = 13
-    lbl.Font = Enum.Font.Code
-    lbl.TextXAlignment = Enum.TextXAlignment.Right
-    lbl.Parent = sg
-
-    local grad = Instance.new("UIGradient")
-    grad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0,   Color3.fromRGB(101,  67,  33)),
-        ColorSequenceKeypoint.new(0.3, Color3.fromRGB(180, 120,  50)),
-        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 210, 120)),
-        ColorSequenceKeypoint.new(0.7, Color3.fromRGB(180, 120,  50)),
-        ColorSequenceKeypoint.new(1,   Color3.fromRGB(101,  67,  33)),
-    })
-    grad.Rotation = 0
-    grad.Parent = lbl
-
-    local _t = 0
-    _RS.Heartbeat:Connect(function(dt)
-        _t += dt * 60
-        grad.Offset = Vector2.new(math.sin(math.rad(_t)) * 0.6, 0)
-    end)
+local function RunSolve()
+	local t = os.clock()
+	Compute()
+	Stats.ms = (os.clock() - t) * 1000
+	Draw()
+	UpdateStats()
 end
 
-SetupWatermark()
+local function Resolve()
+	if Prefs.Active and #Memory.Units > 0 then RunSolve() end
+end
 
--- ==========================================
--- SOLVER RUNSERVICE LOOP
--- ==========================================
-_RS.Heartbeat:Connect(function()
-    local folder = _W:FindFirstChild("Flag") and _W.Flag:FindFirstChild("Parts")
-    if not folder or not Prefs.Active then return end
+local function SetActive(on)
+	Prefs.Active = on
+	if on then
+		Memory.Rebuild = true
+	else
+		HideAll()
+	end
+	UpdateStats()
+end
 
-    if #folder:GetChildren() ~= Memory.Count then
-        Memory.Count = #folder:GetChildren()
-        MapOutEnvironment(folder)
-        Memory.Pending = true
-    end
+--------------------------------------------------------------------
+-- WATERMARK (separate, always visible)
+--------------------------------------------------------------------
+local watermarkGui = Instance.new("ScreenGui")
+watermarkGui.Name = "FoolifiedWatermark"
+watermarkGui.ResetOnSpawn = false
+watermarkGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+watermarkGui.Parent = PlayerGui
 
-    if Memory.Pending then
-        Memory.Pending = false
-        ScanGrid()
-        Compute()
-        
-        -- Pass 1: Set states & create lines
-        for x = 0, Memory.Bounds.X - 1 do
-            for z = 0, Memory.Bounds.Z - 1 do
-                local unit = Memory.Map.Grid[x][z]
-                if unit.part then
-                    if Memory.Map.ToFlag[unit] then RefreshBox(unit, "mine")
-                    elseif Memory.Map.ToClear[unit] then RefreshBox(unit, "safe")
-                    else RefreshBox(unit, "none") end
-                end
-            end
-        end
-        
-        -- Pass 2: Toggle internal/external line visibilities based on neighbors
-        for x = 0, Memory.Bounds.X - 1 do
-            for z = 0, Memory.Bounds.Z - 1 do
-                local unit = Memory.Map.Grid[x][z]
-                if unit.part then
-                    RefreshOutline(unit)
-                end
-            end
-        end
-    end
+local watermarkLabel = Instance.new("TextLabel")
+watermarkLabel.Size = UDim2.new(0, 200, 0, 24)
+watermarkLabel.Position = UDim2.new(1, -208, 1, -32)
+watermarkLabel.BackgroundTransparency = 1
+watermarkLabel.Text = "Made By Foolisher1"
+watermarkLabel.TextColor3 = Color3.new(1, 1, 1)
+watermarkLabel.TextSize = 13
+watermarkLabel.Font = Enum.Font.Code
+watermarkLabel.TextXAlignment = Enum.TextXAlignment.Right
+watermarkLabel.Parent = watermarkGui
+
+local watermarkGrad = Instance.new("UIGradient")
+watermarkGrad.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0,   Color3.fromRGB(101,  67,  33)),
+	ColorSequenceKeypoint.new(0.3, Color3.fromRGB(180, 120,  50)),
+	ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 210, 120)),
+	ColorSequenceKeypoint.new(0.7, Color3.fromRGB(180, 120,  50)),
+	ColorSequenceKeypoint.new(1,   Color3.fromRGB(101,  67,  33)),
+})
+watermarkGrad.Parent = watermarkLabel
+
+local watermarkT = 0
+table.insert(Running, _RS.Heartbeat:Connect(function(dt)
+	watermarkT += dt * 60
+	watermarkGrad.Offset = Vector2.new(math.sin(math.rad(watermarkT)) * 0.6, 0)
+end))
+
+--------------------------------------------------------------------
+-- GUI
+--------------------------------------------------------------------
+local C = {
+	bg     = Color3.fromRGB(15, 13, 11),
+	head   = Color3.fromRGB(23, 19, 15),
+	well   = Color3.fromRGB(9, 8, 7),
+	border = Color3.fromRGB(118, 82, 40),
+	gold   = Color3.fromRGB(232, 184, 96),
+	text   = Color3.fromRGB(222, 210, 190),
+	dim    = Color3.fromRGB(128, 114, 94),
+	tile   = Color3.fromRGB(66, 53, 37),
+}
+local FONT = Enum.Font.Code
+local MINE_HEX = Visuals.M_COL:ToHex()
+local SAFE_HEX = Visuals.S_COL:ToHex()
+local ROW_H = IS_TOUCH and 26 or 20
+
+local function new(class, props)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do
+		if k ~= "Parent" then o[k] = v end
+	end
+	if props.Parent then o.Parent = props.Parent end
+	return o
+end
+
+local function stroke(parent, color)
+	return new("UIStroke", {
+		Color = color or C.border,
+		Thickness = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Parent = parent,
+	})
+end
+
+-- Touch has no hover, and MouseEnter would leave buttons stuck gold after a tap.
+local function hover(btn)
+	if IS_TOUCH then return end
+	btn.MouseEnter:Connect(function() btn.TextColor3 = C.gold end)
+	btn.MouseLeave:Connect(function() btn.TextColor3 = C.dim end)
+end
+
+local function drawIcon(parent, cell, gap, x, y)
+	local ICON = {
+		{ "s", "s", "h" },
+		{ "s", "m", "h" },
+		{ "h", "h", "h" },
+	}
+	local colors = { s = Visuals.S_COL, m = Visuals.M_COL, h = C.tile }
+	for row = 1, 3 do
+		for col = 1, 3 do
+			new("Frame", {
+				Size = UDim2.fromOffset(cell, cell),
+				Position = UDim2.fromOffset(x + (col - 1) * (cell + gap), y + (row - 1) * (cell + gap)),
+				BackgroundColor3 = colors[ICON[row][col]],
+				BorderSizePixel = 0,
+				Parent = parent,
+			})
+		end
+	end
+end
+
+-- Drag by mouse or finger. Tracks one specific touch so the thumbstick finger can't grab it.
+-- A press that doesn't move counts as a tap.
+local function makeDraggable(handle, target, onTap)
+	local active, startInput, startPos, moved = nil, nil, nil, false
+
+	handle.InputBegan:Connect(function(input)
+		local t = input.UserInputType
+		if active or (t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch) then
+			return
+		end
+		active = input
+		startInput = input.Position
+		startPos = target.Position
+		moved = false
+	end)
+
+	table.insert(Running, _UIS.InputChanged:Connect(function(input)
+		if not active then return end
+		local isTouch = active.UserInputType == Enum.UserInputType.Touch
+		if isTouch and input ~= active then return end
+		if not isTouch and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+
+		local d = input.Position - startInput
+		if not moved and d.Magnitude < 6 then return end
+		moved = true
+		target.Position = UDim2.new(
+			startPos.X.Scale, startPos.X.Offset + d.X,
+			startPos.Y.Scale, startPos.Y.Offset + d.Y
+		)
+	end))
+
+	table.insert(Running, _UIS.InputEnded:Connect(function(input)
+		if not active then return end
+		local isTouch = active.UserInputType == Enum.UserInputType.Touch
+		if (isTouch and input == active)
+			or (not isTouch and input.UserInputType == Enum.UserInputType.MouseButton1) then
+			if not moved and onTap then onTap() end
+			active = nil
+		end
+	end))
+end
+
+local gui = new("ScreenGui", {
+	Name = "SweeperUI",
+	ResetOnSpawn = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	Parent = PlayerGui,
+})
+
+local main = new("Frame", {
+	Size = UDim2.fromOffset(236, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	Position = IS_TOUCH and UDim2.fromOffset(60, 10) or UDim2.new(0, 24, 0.5, -90),
+	BackgroundColor3 = C.bg,
+	BorderSizePixel = 0,
+	Parent = gui,
+})
+stroke(main)
+new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = main })
+if IS_TOUCH then
+	new("UIScale", { Scale = 1.15, Parent = main })
+end
+
+-- header
+local header = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 26),
+	BackgroundColor3 = C.head,
+	BorderSizePixel = 0,
+	LayoutOrder = 1,
+	Parent = main,
+})
+new("Frame", {
+	Size = UDim2.new(1, 0, 0, 1),
+	Position = UDim2.new(0, 0, 1, -1),
+	BackgroundColor3 = C.border,
+	BorderSizePixel = 0,
+	Parent = header,
+})
+
+drawIcon(header, 4, 1, 9, 6)
+
+new("TextLabel", {
+	Size = UDim2.new(1, -60, 1, 0),
+	Position = UDim2.fromOffset(30, 0),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 14,
+	TextColor3 = C.gold,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "SWEEPER",
+	Parent = header,
+})
+
+local grip = new("TextButton", {
+	Size = UDim2.new(1, -30, 1, 0),
+	BackgroundTransparency = 1,
+	Text = "",
+	AutoButtonColor = false,
+	ZIndex = 3,
+	Parent = header,
+})
+makeDraggable(grip, main)
+
+local collapseBtn = new("TextButton", {
+	Size = UDim2.fromOffset(30, 26),
+	Position = UDim2.new(1, -30, 0, 0),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 14,
+	TextColor3 = C.dim,
+	Text = "_",
+	AutoButtonColor = false,
+	ZIndex = 3,
+	Parent = header,
+})
+hover(collapseBtn)
+
+-- body
+local body = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	LayoutOrder = 2,
+	Parent = main,
+})
+new("UIPadding", {
+	PaddingLeft = UDim.new(0, 10),
+	PaddingRight = UDim.new(0, 10),
+	PaddingTop = UDim.new(0, 8),
+	PaddingBottom = UDim.new(0, 7),
+	Parent = body,
+})
+new("UIListLayout", {
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Padding = UDim.new(0, 4),
+	Parent = body,
+})
+
+local function Row(text, order, clickable)
+	local row = new(clickable and "TextButton" or "Frame", {
+		Size = UDim2.new(1, 0, 0, ROW_H),
+		BackgroundTransparency = 1,
+		LayoutOrder = order,
+		Parent = body,
+	})
+	if clickable then
+		row.Text = ""
+		row.AutoButtonColor = false
+	end
+	new("TextLabel", {
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Font = FONT,
+		TextSize = 13,
+		TextColor3 = C.text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = text,
+		Parent = row,
+	})
+	return row
+end
+
+-- The whole row is the tap target, not just the little square.
+local function Toggle(text, order, initial, onChange)
+	local row = Row(text, order, true)
+	local box = new("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -2, 0.5, 0),
+		Size = UDim2.fromOffset(14, 14),
+		BackgroundColor3 = C.well,
+		BorderSizePixel = 0,
+		Parent = row,
+	})
+	stroke(box)
+	local fill = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(8, 8),
+		BackgroundColor3 = C.gold,
+		BorderSizePixel = 0,
+		Parent = box,
+	})
+	local state = initial
+	fill.Visible = state
+	row.Activated:Connect(function()
+		state = not state
+		fill.Visible = state
+		onChange(state)
+	end)
+end
+
+local function Stepper(text, order, min, max, step, initial, onChange)
+	local row = Row(text, order, false)
+	local holder = new("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, 0, 0.5, 0),
+		Size = UDim2.new(0, 88, 1, 0),
+		BackgroundTransparency = 1,
+		Parent = row,
+	})
+	local value = initial
+	local label = new("TextLabel", {
+		Size = UDim2.new(1, -56, 1, 0),
+		Position = UDim2.fromOffset(28, 0),
+		BackgroundTransparency = 1,
+		Font = FONT,
+		TextSize = 13,
+		TextColor3 = C.gold,
+		Text = tostring(value),
+		Parent = holder,
+	})
+	local function arrow(glyph, onRight, delta)
+		local b = new("TextButton", {
+			Size = UDim2.new(0, 28, 1, 0),
+			Position = onRight and UDim2.new(1, -28, 0, 0) or UDim2.new(0, 0, 0, 0),
+			BackgroundTransparency = 1,
+			Font = FONT,
+			TextSize = 13,
+			TextColor3 = C.dim,
+			Text = glyph,
+			AutoButtonColor = false,
+			Parent = holder,
+		})
+		hover(b)
+		b.Activated:Connect(function()
+			local v = math.clamp(value + delta, min, max)
+			if v ~= value then
+				value = v
+				label.Text = tostring(v)
+				onChange(v)
+			end
+		end)
+	end
+	arrow("<", false, -step)
+	arrow(">", true, step)
+end
+
+Toggle("solver", 1, Prefs.Active, SetActive)
+
+local minesRow = Row("total mines", 2, false)
+local minesBox = new("TextBox", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -2, 0.5, 0),
+	Size = UDim2.new(0, 56, 1, -4),
+	BackgroundColor3 = C.well,
+	BorderSizePixel = 0,
+	Font = FONT,
+	TextSize = 13,
+	TextColor3 = C.gold,
+	PlaceholderText = "--",
+	PlaceholderColor3 = C.dim,
+	Text = Prefs.TotalMines and tostring(Prefs.TotalMines) or "",
+	ClearTextOnFocus = false,
+	Parent = minesRow,
+})
+stroke(minesBox)
+minesBox.FocusLost:Connect(function()
+	local n = tonumber(minesBox.Text)
+	if n and n >= 1 then
+		n = math.floor(n)
+		Prefs.TotalMines = n
+		minesBox.Text = tostring(n)
+	else
+		Prefs.TotalMines = nil
+		minesBox.Text = ""
+	end
+	Resolve()
 end)
+
+Stepper("depth", 3, 8, 18, 2, Prefs.MaxCluster, function(v)
+	Prefs.MaxCluster = v
+	Resolve()
+end)
+
+new("Frame", {
+	Size = UDim2.new(1, 0, 0, 1),
+	BackgroundColor3 = C.border,
+	BackgroundTransparency = 0.45,
+	BorderSizePixel = 0,
+	LayoutOrder = 4,
+	Parent = body,
+})
+
+local statsLabel = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 16),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 13,
+	TextColor3 = C.dim,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	RichText = true,
+	Text = "waiting for board",
+	LayoutOrder = 5,
+	Parent = body,
+})
+
+UpdateStats = function()
+	if not Prefs.Active then
+		statsLabel.Text = "solver off"
+	elseif #Memory.Units == 0 then
+		statsLabel.Text = "waiting for board"
+	else
+		statsLabel.Text = string.format(
+			'mines <font color="#%s">%d</font>   safe <font color="#%s">%d</font>   %.1fms',
+			MINE_HEX, Stats.mines, SAFE_HEX, Stats.safe, Stats.ms or 0
+		)
+	end
+end
+
+collapseBtn.Activated:Connect(function()
+	body.Visible = not body.Visible
+	collapseBtn.Text = body.Visible and "_" or "+"
+end)
+
+local function togglePanel()
+	main.Visible = not main.Visible
+end
+
+-- Keyboard: RightShift shows/hides the panel.
+table.insert(Running, _UIS.InputBegan:Connect(function(input, processed)
+	if not processed and input.KeyCode == Prefs.ToggleKey then
+		togglePanel()
+	end
+end))
+
+-- Touch: small floating button (tap = show/hide panel, drag = move it).
+if IS_TOUCH then
+	local fab = new("Frame", {
+		Size = UDim2.fromOffset(40, 40),
+		Position = UDim2.fromOffset(10, 10),
+		BackgroundColor3 = C.head,
+		BorderSizePixel = 0,
+		Parent = gui,
+	})
+	stroke(fab)
+	drawIcon(fab, 6, 2, 9, 9)
+	local fabHit = new("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		ZIndex = 3,
+		Parent = fab,
+	})
+	makeDraggable(fabHit, fab, togglePanel)
+end
+
+--------------------------------------------------------------------
+-- MAIN LOOP
+--------------------------------------------------------------------
+table.insert(Running, _RS.Heartbeat:Connect(function()
+	if not Prefs.Active then return end
+
+	local flag = _W:FindFirstChild("Flag")
+	local folder = flag and flag:FindFirstChild("Parts")
+	if not folder then
+		if Memory.Folder then
+			ResetBoard()
+			UpdateStats()
+		end
+		return
+	end
+
+	if folder ~= Memory.Folder or Memory.Rebuild then
+		BuildGrid(folder)
+		UpdateStats()
+	end
+
+	if next(Memory.DirtyUnits) == nil then return end
+
+	local dirty = Memory.DirtyUnits
+	Memory.DirtyUnits = {}
+	local changed = false
+
+	for unit in pairs(dirty) do
+		if unit.part.Parent ~= folder then
+			Memory.Rebuild = true
+			return
+		end
+		if ScanUnit(unit) then changed = true end
+	end
+
+	if changed then RunSolve() end
+end))
+
+_G.__SweeperCleanup = function()
+	for _, c in ipairs(Running) do c:Disconnect() end
+	ResetBoard()
+	gui:Destroy()
+	watermarkGui:Destroy()
+end
